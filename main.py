@@ -218,3 +218,20 @@ def lunar_string(
     """
     result = build_two_lines(d)
     return result["text"]
+
+@app.get("/debug-raw")
+def debug_raw(
+    d: date = Query(..., description="Date in YYYY-MM-DD"),
+    n: int = Query(2000, description="How many chars to return"),
+):
+    """
+    Returns first N chars of the cleaned page text (to debug parsing).
+    DO NOT keep this endpoint in production long-term.
+    """
+    txt = fetch_page_text(d)
+    return {
+        "date": d.isoformat(),
+        "len": len(txt),
+        "sample": txt[:n]
+    }
+
