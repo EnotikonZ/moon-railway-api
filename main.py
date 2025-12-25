@@ -1,8 +1,8 @@
 import os
 import re
 import logging
-from datetime import date
-from typing import Dict, Any, List
+from datetime import date, datetime, timedelta, timezone
+from typing import Dict, Any, List, Optional
 
 import requests
 from fastapi import FastAPI, Query, HTTPException
@@ -41,7 +41,26 @@ HEADERS = {
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
 
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(60 * 60 * 24)))  # 24h
-cache = TTLCache(maxsize=2000, ttl=CACHE_TTL_SECONDS)
+cache = TTLCache(maxsize=3000, ttl=CACHE_TTL_SECONDS)
+
+# Moscow timezone fixed (UTC+3)
+MSK = timezone(timedelta(hours=3))
+TZ_NAME = "Europe/Moscow"
+
+RU_MONTH = {
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+}
 
 # ----------------------------
 # HTTP SESSION WITH RETRIES
@@ -69,24 +88,17 @@ SESSION = _make_session()
 # ----------------------------
 
 app = FastAPI(
-    title="Lunar Day API (Rambler)",
-    version="2.0.0"
+    title="Lunar Day API (Rambler, MSK)",
+    version="3.0.0"
 )
 
 # ----------------------------
 # PARSING
 # ----------------------------
 
-# Пример строки в тексте:
+# Пример строки:
 # "6 лунный день 24 декабря 11:35 — 25 декабря 11:42"
 # "7 лунный день Рыбы 25 декабря 11:42 — 26 декабря 11:49"
-#
-# Нам нужно достать 1-2 таких интервала для выбранной даты.
-#
-# Пояснения:
-# - после "лунный день" может быть знак зодиака (одно слово) или ничего
-# - разделитель бывает "—" (длинное тире) или "-"
-#
 RE_INTERVAL = re.compile(
     r"(?P<day>\d{1,2})\s+лунный\s+день"
     r"(?:\s+(?P<zodiac>[А-Яа-яЁё]+))?"
@@ -97,7 +109,6 @@ RE_INTERVAL = re.compile(
 )
 
 def fetch_page_text(d: date) -> str:
-    """Fetch Rambler page HTML and convert to plain text."""
     date_str = d.isoformat()
     url = RAMBLER_URL.format(calendar_date=date_str)
 
@@ -121,75 +132,123 @@ def fetch_page_text(d: date) -> str:
         logger.warning("Non-200 from Rambler. status=%s sample=%s", status, sample)
         raise HTTPException(status_code=502, detail=f"Rambler returned status {status}")
 
-    # Strip scripts/styles/tags
     text = re.sub(r"<script[^>]*>.*?</script>", " ", html_text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
 
-    logger.info("Text sample for %s: %s", date_str, text[:400])
     return text
+
+
+def _month_num(month_ru: str) -> int:
+    m = RU_MONTH.get(month_ru.lower())
+    if not m:
+        raise HTTPException(status_code=502, detail=f"Unknown month word: {month_ru}")
+    return m
+
+
+def _parse_dt(year: int, day: int, month_ru: str, time_str: str) -> datetime:
+    """
+    Build timezone-aware datetime in MSK from components.
+    """
+    m = _month_num(month_ru)
+    hh, mm = time_str.split(":")
+    return datetime(year, m, int(day), int(hh), int(mm), tzinfo=MSK)
 
 
 def extract_intervals(d: date) -> List[Dict[str, Any]]:
     """
-    Возвращает список интервалов на странице даты (обычно 2 штуки):
-    [
-      {"day": 6, "zodiac": None, "from": "24 декабря 11:35", "to": "25 декабря 11:42"},
-      {"day": 7, "zodiac": "Рыбы", "from": "25 декабря 11:42", "to": "26 декабря 11:49"},
-    ]
+    Returns 1-2 intervals with ISO datetimes.
     """
     date_str = d.isoformat()
-    cache_key = ("intervals", date_str)
+    cache_key = ("intervals_iso", date_str)
     if cache_key in cache:
         return cache[cache_key]
 
     text = fetch_page_text(d)
-
     matches = list(RE_INTERVAL.finditer(text))
+
     if not matches:
-        logger.warning("Could not find lunar intervals for %s. Text excerpt: %s", date_str, text[:1000])
+        logger.warning("Could not find lunar intervals for %s. Excerpt: %s", date_str, text[:1200])
         raise HTTPException(status_code=502, detail="Could not parse Rambler page (blocked or markup changed)")
 
     intervals: List[Dict[str, Any]] = []
-    for m in matches[:4]:  # на всякий случай ограничим
-        day = int(m.group("day"))
+    for m in matches[:4]:
+        day_num = int(m.group("day"))
         zodiac = m.group("zodiac")
         if zodiac:
             zodiac = zodiac.strip()
-        from_str = f"{m.group('d1')} {m.group('m1')} {m.group('t1')}"
-        to_str = f"{m.group('d2')} {m.group('m2')} {m.group('t2')}"
+
+        start_dt = _parse_dt(d.year, int(m.group("d1")), m.group("m1"), m.group("t1"))
+        end_dt = _parse_dt(d.year, int(m.group("d2")), m.group("m2"), m.group("t2"))
+
         intervals.append({
-            "day": day,
+            "day": day_num,
             "zodiac": zodiac,
-            "from": from_str,
-            "to": to_str,
+            "startIso": start_dt.isoformat(),
+            "endIso": end_dt.isoformat(),
+            "startTime": start_dt.strftime("%H:%M"),
+            "endTime": end_dt.strftime("%H:%M"),
+            "startText": f"{m.group('d1')} {m.group('m1')} {m.group('t1')}",
+            "endText": f"{m.group('d2')} {m.group('m2')} {m.group('t2')}",
         })
 
-    # Обычно на странице есть ровно те интервалы, которые нужны для выбранной даты,
-    # поэтому возвращаем первые два.
     result = intervals[:2]
     cache[cache_key] = result
     return result
 
 
-def build_text(d: date) -> Dict[str, Any]:
-    intervals = extract_intervals(d)
+def pick_current(intervals: List[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
+    """
+    Pick active interval for current time (MSK).
+    If not inside any, choose the closest future or last.
+    """
+    # Convert to datetime
+    parsed = []
+    for it in intervals:
+        s = datetime.fromisoformat(it["startIso"])
+        e = datetime.fromisoformat(it["endIso"])
+        parsed.append((s, e, it))
 
+    # inside interval
+    for s, e, it in parsed:
+        if s <= now < e:
+            return it
+
+    # if before first -> first
+    if now < parsed[0][0]:
+        return parsed[0][2]
+
+    # otherwise -> last
+    return parsed[-1][2]
+
+
+def build_payload(d: date) -> Dict[str, Any]:
+    intervals = extract_intervals(d)
+    now_msk = datetime.now(MSK)
+    current = pick_current(intervals, now_msk)
+
+    # next switch = end of current interval (if current end is in the future)
+    current_end = datetime.fromisoformat(current["endIso"])
+    next_switch = current_end if current_end > now_msk else None
+
+    # “удобные строки” как ты любишь
     lines = []
     for it in intervals:
         if it["zodiac"]:
-            lines.append(f"{it['day']} лунный день {it['zodiac']} {it['from']} — {it['to']}")
+            lines.append(f"{it['day']} лунный день {it['zodiac']} {it['startText']} — {it['endText']}")
         else:
-            lines.append(f"{it['day']} лунный день {it['from']} — {it['to']}")
-
-    text = "\n".join(lines)
+            lines.append(f"{it['day']} лунный день {it['startText']} — {it['endText']}")
 
     return {
         "date": d.isoformat(),
+        "tz": TZ_NAME,
+        "nowIso": now_msk.isoformat(),
         "lines": lines,
-        "text": text,
         "intervals": intervals,
+        "current": current,
+        "nextSwitchAtIso": next_switch.isoformat() if next_switch else None,
+        "nextSwitchInSeconds": int((next_switch - now_msk).total_seconds()) if next_switch else None,
     }
 
 # ----------------------------
@@ -205,14 +264,41 @@ def health():
 def lunar_text(
     d: date = Query(..., description="Date in YYYY-MM-DD"),
 ):
-    return build_text(d)
+    return build_payload(d)
 
 
 @app.get("/lunar-string")
 def lunar_string(
     d: date = Query(..., description="Date in YYYY-MM-DD"),
 ):
-    return build_text(d)["text"]
+    payload = build_payload(d)
+    return "\n".join(payload["lines"])
+
+
+@app.get("/lunar-now")
+def lunar_now(
+    d: date = Query(..., description="Date in YYYY-MM-DD"),
+):
+    """
+    Optimized for UI auto-fill:
+    - current.startTime
+    - current.endTime
+    - current.day
+    - current.zodiac
+    - nextSwitchAtIso
+    - nextSwitchInSeconds
+    """
+    payload = build_payload(d)
+    return {
+        "date": payload["date"],
+        "tz": payload["tz"],
+        "nowIso": payload["nowIso"],
+        "current": payload["current"],
+        "nextSwitchAtIso": payload["nextSwitchAtIso"],
+        "nextSwitchInSeconds": payload["nextSwitchInSeconds"],
+        "intervals": payload["intervals"],
+        "lines": payload["lines"],
+    }
 
 
 @app.get("/debug-raw")
@@ -221,8 +307,4 @@ def debug_raw(
     n: int = Query(2000, description="How many chars to return"),
 ):
     txt = fetch_page_text(d)
-    return {
-        "date": d.isoformat(),
-        "len": len(txt),
-        "sample": txt[:n],
-    }
+    return {"date": d.isoformat(), "len": len(txt), "sample": txt[:n]}
