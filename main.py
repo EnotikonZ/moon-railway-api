@@ -1,11 +1,21 @@
 import os
 import re
-from datetime import date, datetime, timedelta
+import logging
+from datetime import date, timedelta
 from typing import Optional, Tuple, Dict, Any
 
 import requests
 from fastapi import FastAPI, Query, HTTPException
 from cachetools import TTLCache
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# ----------------------------
+# LOGGING
+# ----------------------------
+
+logger = logging.getLogger("moon_api")
+logging.basicConfig(level=logging.INFO)
 
 # ----------------------------
 # CONFIG
@@ -21,29 +31,52 @@ HEADERS = {
     ),
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://horoscopes.rambler.ru/",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
     "Connection": "close",
 }
 
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
 
-# Cache: key = (date_str), value = dict with parsed info
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", str(60 * 60 * 24)))  # 24h
 cache = TTLCache(maxsize=2000, ttl=CACHE_TTL_SECONDS)
 
 # Regex patterns for Rambler common phrasing:
-# "До 11:42 — 6-й лунный день"
-# "После 11:42 — 7-й лунный день"
 RE_UNTIL = re.compile(
-    r"До\s+(?P<time>\d{1,2}:\d{2}).{0,80}?(?P<day>\d{1,2})[-\s]*й\s+лунн",
+    r"До\s+(?P<time>\d{1,2}:\d{2}).{0,120}?(?P<day>\d{1,2})[-\s]*й\s+лунн",
     re.IGNORECASE
 )
 RE_AFTER = re.compile(
-    r"После\s+(?P<time>\d{1,2}:\d{2}).{0,80}?(?P<day>\d{1,2})[-\s]*й\s+лунн",
+    r"После\s+(?P<time>\d{1,2}:\d{2}).{0,120}?(?P<day>\d{1,2})[-\s]*й\s+лунн",
     re.IGNORECASE
 )
 
-# Fallback: just any "N-й лунный день"
 RE_ANY_LUNAR_DAY = re.compile(r"(?P<day>\d{1,2})[-\s]*й\s+лунн", re.IGNORECASE)
+
+# ----------------------------
+# HTTP SESSION WITH RETRIES
+# ----------------------------
+
+def _make_session() -> requests.Session:
+    session = requests.Session()
+
+    retry = Retry(
+        total=3,
+        backoff_factor=0.7,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    return session
+
+
+SESSION = _make_session()
 
 # ----------------------------
 # APP
@@ -51,43 +84,54 @@ RE_ANY_LUNAR_DAY = re.compile(r"(?P<day>\d{1,2})[-\s]*й\s+лунн", re.IGNOREC
 
 app = FastAPI(
     title="Lunar Day API (Rambler)",
-    version="1.0.0"
+    version="1.1.0"
 )
-
 
 # ----------------------------
 # HELPERS
 # ----------------------------
 
 def fetch_page_text(d: date) -> str:
-    """Fetch Rambler page text for given date, return cleaned text."""
+    """
+    Fetch Rambler page HTML and convert to plain text.
+    Also logs status code and a text sample for debugging.
+    """
     date_str = d.isoformat()
-
-    # cache raw text (optional): we cache parsed transition, so no need
     url = RAMBLER_URL.format(calendar_date=date_str)
 
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        resp = SESSION.get(url, headers=HEADERS, timeout=TIMEOUT)
     except requests.exceptions.Timeout:
+        logger.exception("Timeout while fetching Rambler for %s", date_str)
         raise HTTPException(status_code=504, detail="Timeout fetching Rambler")
     except requests.RequestException as e:
+        logger.exception("Request error while fetching Rambler for %s: %s", date_str, str(e))
         raise HTTPException(status_code=502, detail=f"Request error: {e}")
 
-    if resp.status_code != 200:
-        # Rambler sometimes returns 403/429 on blocks
-        raise HTTPException(status_code=502, detail=f"Rambler returned status {resp.status_code}")
-
-    # We use .text to decode properly (requests handles encoding)
-    html_text = resp.text
+    status = resp.status_code
+    html_text = resp.text or ""
     resp.close()
 
-    # Convert HTML -> plain text quickly without bs4:
-    # We'll strip tags rough with regex to keep dependencies small
-    # (bs4 is ok too, but regex is enough for our patterns)
+    logger.info("Rambler fetch %s -> status=%s html_len=%s", url, status, len(html_text))
+
+    if status != 200:
+        # Log a short html sample (may show block/captcha)
+        sample = re.sub(r"\s+", " ", html_text[:1500]).strip()
+        logger.warning("Non-200 from Rambler. status=%s sample=%s", status, sample)
+        raise HTTPException(status_code=502, detail=f"Rambler returned status {status}")
+
+    # Remove scripts/styles
     text = re.sub(r"<script[^>]*>.*?</script>", " ", html_text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Strip tags
     text = re.sub(r"<[^>]+>", " ", text)
+
+    # Normalize whitespace
     text = re.sub(r"\s+", " ", text).strip()
+
+    # Debug sample: helpful to see what we got
+    logger.info("Text sample for %s: %s", date_str, text[:500])
 
     return text
 
@@ -111,7 +155,7 @@ def extract_transition(d: date) -> Tuple[Optional[str], Optional[int], Optional[
     if m_until and m_after:
         t1 = m_until.group("time")
         t2 = m_after.group("time")
-        t = t1 if t1 == t2 else t1  # usually same
+        t = t1 if t1 == t2 else t1
         before_day = int(m_until.group("day"))
         after_day = int(m_after.group("day"))
         result = (t, before_day, after_day)
@@ -126,7 +170,8 @@ def extract_transition(d: date) -> Tuple[Optional[str], Optional[int], Optional[
         cache[cache_key] = result
         return result
 
-    # Could be blocked page or markup changed
+    # Log text excerpt so we can adjust regex
+    logger.warning("Could not parse transition for %s. Text excerpt: %s", date_str, text[:800])
     raise HTTPException(status_code=502, detail="Could not parse Rambler page (blocked or markup changed)")
 
 
@@ -136,18 +181,18 @@ def format_ru_date(d: date) -> str:
 
 def build_two_lines(d: date) -> Dict[str, Any]:
     """
-    Build the final text for date d:
+    Build:
     line1: previous lunar day from yesterday transition -> today transition
     line2: current lunar day from today transition -> "до следующего дня"
     """
-
     t_today, before_today, after_today = extract_transition(d)
 
-    # If no transition today, return a single-line fallback
     if not t_today or before_today is None or after_today is None:
+        # no transition in this date
         day_num = after_today if after_today is not None else before_today
         if day_num is None:
             raise HTTPException(status_code=502, detail="Could not determine lunar day number")
+
         text = f"{day_num} лунный день {format_ru_date(d)} (без смены в течение суток)"
         return {
             "date": d.isoformat(),
@@ -159,13 +204,11 @@ def build_two_lines(d: date) -> Dict[str, Any]:
             "text": text,
         }
 
-    # Yesterday transition gives us the start time for the "before_today" day
     d_prev = d - timedelta(days=1)
-    t_prev, before_prev, after_prev = extract_transition(d_prev)
+    t_prev, _, _ = extract_transition(d_prev)
 
-    # Ideally: after_prev == before_today
-    # But sometimes parsing differs; we still use t_prev as start time.
     start_time = t_prev if t_prev else "00:00"
+
     line1 = (
         f"{before_today} лунный день c {start_time} {format_ru_date(d_prev)} "
         f"по {t_today} {format_ru_date(d)}"
@@ -185,7 +228,6 @@ def build_two_lines(d: date) -> Dict[str, Any]:
         "text": line1 + "\n" + line2,
     }
 
-
 # ----------------------------
 # ROUTES
 # ----------------------------
@@ -199,13 +241,6 @@ def health():
 def lunar_text(
     d: date = Query(..., description="Date in YYYY-MM-DD"),
 ):
-    """
-    Returns:
-    {
-      "text": "6 лунный день ...\n7 лунный день ...",
-      ...metadata
-    }
-    """
     return build_two_lines(d)
 
 
@@ -213,11 +248,9 @@ def lunar_text(
 def lunar_string(
     d: date = Query(..., description="Date in YYYY-MM-DD"),
 ):
-    """
-    Returns plain string (useful for Lovable as one text field).
-    """
     result = build_two_lines(d)
     return result["text"]
+
 
 @app.get("/debug-raw")
 def debug_raw(
@@ -225,13 +258,12 @@ def debug_raw(
     n: int = Query(2000, description="How many chars to return"),
 ):
     """
-    Returns first N chars of the cleaned page text (to debug parsing).
-    DO NOT keep this endpoint in production long-term.
+    Returns first N chars of cleaned text for debugging parsing.
+    Remove this endpoint later.
     """
     txt = fetch_page_text(d)
     return {
         "date": d.isoformat(),
         "len": len(txt),
-        "sample": txt[:n]
+        "sample": txt[:n],
     }
-
